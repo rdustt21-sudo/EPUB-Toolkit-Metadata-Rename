@@ -17,12 +17,37 @@ jobs:
 
       - name: Find and extract project ZIP
         run: |
+          mkdir -p source
+
           ZIP_FILE=$(find . -maxdepth 1 -type f -name '*.zip' | head -n 1)
+
           if [ -z "$ZIP_FILE" ]; then
             echo "No project ZIP found!"
             exit 1
           fi
-          unzip "$ZIP_FILE" -d source
+
+          unzip -o "$ZIP_FILE" -d source
+
+      - name: Locate Android project
+        id: locate
+        run: |
+          PROJECT_FILE=$(find source -type f \
+            \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) \
+            -print -quit)
+
+          if [ -z "$PROJECT_FILE" ]; then
+            echo "Android Gradle project not found!"
+            echo "Extracted files:"
+            find source -maxdepth 4 -type f | head -100
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$PROJECT_FILE")
+          PROJECT_DIR=$(realpath "$PROJECT_DIR")
+
+          echo "Project directory: $PROJECT_DIR"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "apk_path=$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" >> "$GITHUB_OUTPUT"
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -39,11 +64,18 @@ jobs:
           gradle-version: '8.10.2'
 
       - name: Build APK
-        working-directory: source/EPUB-Toolkit-Android-main
-        run: gradle assembleDebug
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            ./gradlew assembleDebug
+          else
+            gradle assembleDebug
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: EPUB-Toolkit-SecondSpace-APK
-          path: source/EPUB-Toolkit-Android-main/app/build/outputs/apk/debug/app-debug.apk
+          path: ${{ steps.locate.outputs.apk_path }}
+          if-no-files-found: error
