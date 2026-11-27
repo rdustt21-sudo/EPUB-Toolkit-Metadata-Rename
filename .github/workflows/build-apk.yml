@@ -1,11 +1,10 @@
 
-name: Build Android APK V5
+name: Build V5 - Verified Source
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
 
 permissions:
   contents: write
@@ -15,110 +14,84 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Select newest project ZIP
-        id: select_zip
+      - name: Select source by Gradle version
+        id: source
         shell: bash
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
-          import glob, re, sys
+          import glob, zipfile, tempfile, os, re, shutil
 
           candidates = []
-          for f in glob.glob("*.zip"):
-              m = re.search(r'V(\d+\.\d+\.\d+)', f, re.I)
-              if m and "EPUB-Toolkit" in f:
-                  version = tuple(map(int, m.group(1).split(".")))
-                  candidates.append((version, f))
+
+          for z in glob.glob("*.zip"):
+              tmp = tempfile.mkdtemp(prefix="epub-check-")
+              try:
+                  with zipfile.ZipFile(z) as archive:
+                      archive.extractall(tmp)
+
+                  for root, dirs, files in os.walk(tmp):
+                      if "settings.gradle" not in files and "settings.gradle.kts" not in files:
+                          continue
+
+                      gradle = os.path.join(root, "app", "build.gradle")
+                      if not os.path.isfile(gradle):
+                          continue
+
+                      content = open(gradle, encoding="utf-8").read()
+
+                      appid = re.search(r"applicationId\s+['\"]([^'\"]+)['\"]", content)
+                      code = re.search(r"versionCode\s+(\d+)", content)
+                      name = re.search(r"versionName\s+['\"]([^'\"]+)['\"]", content)
+
+                      if not appid or not code or not name:
+                          continue
+
+                      if appid.group(1) != "com.rdustt21.epubtoolkit.v5":
+                          continue
+
+                      version_code = int(code.group(1))
+                      version_name = name.group(1)
+
+                      if version_code < 519:
+                          continue
+
+                      candidates.append({
+                          "zip": z,
+                          "root": root,
+                          "code": version_code,
+                          "name": version_name
+                      })
+              except Exception as e:
+                  print(f"Skipped {z}: {e}")
+              finally:
+                  # Keep extracted candidates until selection.
+                  pass
 
           if not candidates:
-              sys.exit("ERROR: No versioned EPUB-Toolkit project ZIP found.")
+              raise SystemExit(
+                  "STOP: No valid V5 source ZIP with versionCode >= 519 found."
+              )
 
-          candidates.sort(reverse=True)
-          version, filename = candidates[0]
+          candidates.sort(key=lambda x: x["code"], reverse=True)
+          selected = candidates[0]
 
-          print(f"Selected source: {filename}")
-          print(f"Selected version: {version}")
+          print("SELECTED SOURCE:", selected["zip"])
+          print("PROJECT ROOT:", selected["root"])
+          print("VERSION NAME:", selected["name"])
+          print("VERSION CODE:", selected["code"])
 
-          with open("selected_zip.txt", "w") as f:
-              f.write(filename)
+          shutil.rmtree("project", ignore_errors=True)
+          shutil.copytree(selected["root"], "project")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("version_name=" + selected["name"] + "\n")
+              f.write("version_code=" + str(selected["code"]) + "\n")
           PY
-
-          ZIP_FILE=$(cat selected_zip.txt)
-          echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
-          echo "Selected ZIP: $ZIP_FILE"
-
-      - name: Extract project ZIP
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p source
-          unzip -o "${{ steps.select_zip.outputs.zip_file }}" -d source
-
-      - name: Extract nested ZIPs
-        shell: bash
-        run: |
-          set -euo pipefail
-          count=0
-
-          while inner=$(find source -type f -name '*.zip' -print -quit) && [[ -n "$inner" ]]; do
-            count=$((count+1))
-            [[ $count -le 5 ]] || {
-              echo "ERROR: Too many nested ZIP levels"
-              exit 1
-            }
-
-            dest="source/extracted-$count"
-            mkdir -p "$dest"
-            mv "$inner" "/tmp/project-$count.zip"
-            unzip -o "/tmp/project-$count.zip" -d "$dest"
-          done
-
-      - name: Locate and validate project
-        id: locate
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          project_file=$(find source \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)
-          [[ -n "$project_file" ]] || {
-            echo "ERROR: Android project not found"
-            exit 1
-          }
-
-          project_dir=$(dirname "$project_file")
-          gradle_file="$project_dir/app/build.gradle"
-
-          [[ -f "$gradle_file" ]] || {
-            echo "ERROR: app/build.gradle missing"
-            exit 1
-          }
-
-          APP_ID=$(grep -E "applicationId ['\"]" "$gradle_file" | head -n 1 | sed -E "s/.*applicationId ['\"]([^'\"]+).*/\1/")
-          VERSION_CODE=$(grep -E "versionCode[[:space:]]+[0-9]+" "$gradle_file" | head -n 1 | awk '{print $2}')
-          VERSION_NAME=$(grep -E "versionName ['\"]" "$gradle_file" | head -n 1 | sed -E "s/.*versionName ['\"]([^'\"]+).*/\1/")
-
-          echo "Application ID: $APP_ID"
-          echo "Version name: $VERSION_NAME"
-          echo "Version code: $VERSION_CODE"
-
-          [[ "$APP_ID" == "com.rdustt21.epubtoolkit.v5" ]] || {
-            echo "ERROR: Application ID mismatch"
-            exit 1
-          }
-
-          [[ "$VERSION_CODE" -ge 519 ]] || {
-            echo "ERROR: Old project ZIP detected. Minimum versionCode is 519."
-            exit 1
-          }
-
-          echo "project_dir=$project_dir" >> "$GITHUB_OUTPUT"
-          echo "apk_path=$project_dir/app/build/outputs/apk/debug/app-debug.apk" >> "$GITHUB_OUTPUT"
-          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
-          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -135,19 +108,14 @@ jobs:
           gradle-version: '8.10.2'
 
       - name: Install persistent signing key
-        shell: bash
         env:
           KEYSTORE_BASE64: ${{ secrets.V5_DEBUG_KEYSTORE_BASE64 }}
         run: |
           set -euo pipefail
-
-          [[ -n "$KEYSTORE_BASE64" ]] || {
-            echo "ERROR: V5_DEBUG_KEYSTORE_BASE64 missing"
-            exit 1
-          }
-
+          test -n "$KEYSTORE_BASE64"
           mkdir -p "$HOME/.android"
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$HOME/.android/debug.keystore"
+          printf '%s' "$KEYSTORE_BASE64" \
+            | base64 --decode > "$HOME/.android/debug.keystore"
           chmod 600 "$HOME/.android/debug.keystore"
 
           keytool -list \
@@ -156,51 +124,59 @@ jobs:
             -alias androiddebugkey
 
       - name: Build APK
-        working-directory: ${{ steps.locate.outputs.project_dir }}
+        working-directory: project
+        run: |
+          set -euo pipefail
+          gradle assembleDebug
+
+      - name: Verify APK identity and version
         shell: bash
         run: |
           set -euo pipefail
 
-          if [[ -f ./gradlew ]]; then
-            chmod +x ./gradlew
-            ./gradlew assembleDebug
-          else
-            gradle assembleDebug
-          fi
-
-      - name: Verify APK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          apk="${{ steps.locate.outputs.apk_path }}"
-          [[ -f "$apk" ]] || {
-            echo "ERROR: APK missing"
-            exit 1
-          }
+          APK="project/app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$APK"
 
           BUILD_TOOLS=$(find "$ANDROID_HOME/build-tools" \
             -mindepth 1 -maxdepth 1 -type d \
-            -print | sort -V | tail -n 1)
+            | sort -V | tail -n 1)
 
-          "$BUILD_TOOLS/apksigner" verify --print-certs "$apk"
-          ls -lh "$apk"
+          AAPT="$BUILD_TOOLS/aapt"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
 
-      - name: Upload APK Artifact
+          BADGING=$("$AAPT" dump badging "$APK")
+          echo "$BADGING" | grep "^package:"
+
+          echo "$BADGING" | grep -F \
+            "name='com.rdustt21.epubtoolkit.v5'" >/dev/null
+
+          echo "$BADGING" | grep -F \
+            "versionCode='${{ steps.source.outputs.version_code }}'" >/dev/null
+
+          echo "$BADGING" | grep -F \
+            "versionName='${{ steps.source.outputs.version_name }}'" >/dev/null
+
+          "$APKSIGNER" verify --print-certs "$APK"
+
+          echo "APK VERIFIED"
+          ls -lh "$APK"
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: EPUB-Toolkit-V5-APK
-          path: ${{ steps.locate.outputs.apk_path }}
+          name: EPUB-Toolkit-V5-${{ steps.source.outputs.version_name }}
+          path: project/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
 
-      - name: Publish direct APK download
+      - name: Publish APK Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: apk-${{ github.run_id }}-${{ github.run_attempt }}
-          name: EPUB Toolkit V5 ${{ steps.locate.outputs.version_name }}
+          tag_name: verified-v${{ steps.source.outputs.version_name }}-${{ github.run_id }}
+          name: EPUB Toolkit V5 ${{ steps.source.outputs.version_name }}
           prerelease: true
           generate_release_notes: false
           body: |
-            APK built from the newest versioned EPUB-Toolkit source ZIP.
-            Version and package identity were checked before build.
-          files: ${{ steps.locate.outputs.apk_path }}
+            Verified APK.
+            Source version: ${{ steps.source.outputs.version_name }}
+            Source versionCode: ${{ steps.source.outputs.version_code }}
+          files: project/app/build/outputs/apk/debug/app-debug.apk
