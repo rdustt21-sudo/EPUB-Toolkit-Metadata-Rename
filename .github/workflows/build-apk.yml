@@ -1,35 +1,6 @@
 
-name: Build Android APK
-
-on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-
-    steps:
-      # 1. Checkout repository
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # 2. Extract outer project ZIP
-      - name: Extract outer ZIP
-        shell: bash
-        run: |
-          set -e
-
-          mkdir -p source
-
-          ZIP_FILE=$(find . -maxdepth 1 -type f -name '*.zip' | head -n 1)
-
-          if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: No project ZIP found in repository root!"
-            exit 1
-          fi
+    
+  
 
           echo "Extracting: $ZIP_FILE"
           unzip -o "$ZIP_FILE" -d source
@@ -121,6 +92,17 @@ jobs:
         with:
           gradle-version: '8.10.2'
 
+      # 7.5 Install stable V5 debug signing key
+      - name: Setup persistent V5 signing key
+        shell: bash
+        run: |
+          set -e
+          mkdir -p "$HOME/.android"
+          echo "$V5_DEBUG_KEYSTORE_BASE64" | base64 --decode > "$HOME/.android/debug.keystore"
+          chmod 600 "$HOME/.android/debug.keystore"
+        env:
+          V5_DEBUG_KEYSTORE_BASE64: ${{ secrets.V5_DEBUG_KEYSTORE_BASE64 }}
+
       # 8. Build APK
       - name: Build Android APK
         working-directory: ${{ steps.locate.outputs.project_dir }}
@@ -147,12 +129,4 @@ jobs:
           fi
 
           echo "APK successfully generated."
-          ls -lh "$APK"
 
-      # 10. Upload APK
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: EPUB-Toolkit-Folder-Filter-v5-APK
-          path: ${{ steps.locate.outputs.apk_path }}
-          if-no-files-found: error
