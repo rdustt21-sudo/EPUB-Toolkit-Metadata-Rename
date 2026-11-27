@@ -99,11 +99,7 @@ jobs:
           set -euo pipefail
           apk="${{ steps.locate.outputs.apk_path }}"
           [[ -f "$apk" ]] || { echo "ERROR: APK not generated" >&2; exit 1; }
-          # Gradle installs Android Build Tools, but apksigner is not always on PATH.
-          apksigner_path=$(find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools" -type f -name apksigner -print 2>/dev/null | sort -V | tail -n 1)
-          [[ -n "$apksigner_path" ]] || { echo "ERROR: apksigner not found in Android SDK Build Tools" >&2; exit 1; }
-          echo "Using apksigner: $apksigner_path"
-          "$apksigner_path" verify --print-certs "$apk"
+          apksigner verify --print-certs "$apk"
           ls -lh "$apk"
 
       - name: Upload APK artifact
