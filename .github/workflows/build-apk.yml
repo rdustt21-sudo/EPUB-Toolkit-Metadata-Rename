@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build Android APK (Stable V5 Signing)
 
 on:
   workflow_dispatch:
@@ -9,7 +9,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -17,67 +16,40 @@ jobs:
       - name: Extract outer ZIP
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p source
-          ZIP_FILE=$(find . -maxdepth 1 -type f -name '*.zip' | head -n 1)
-          if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: No project ZIP found in repository root!"
+          ZIP_FILE=$(find . -maxdepth 1 -type f -name '*.zip' -print -quit)
+          if [[ -z "$ZIP_FILE" ]]; then
+            echo "ERROR: No project ZIP found in repository root" >&2
             exit 1
           fi
-          echo "Extracting: $ZIP_FILE"
           unzip -o "$ZIP_FILE" -d source
 
       - name: Extract nested project ZIPs
         shell: bash
         run: |
-          set -e
-          COUNT=0
-          MAX_LEVELS=5
-          while true; do
-            INNER_ZIP=$(find source -type f -name '*.zip' -print -quit)
-            if [ -z "$INNER_ZIP" ]; then
-              echo "No more nested ZIP files."
-              break
-            fi
-            COUNT=$((COUNT + 1))
-            if [ "$COUNT" -gt "$MAX_LEVELS" ]; then
-              echo "ERROR: Too many nested ZIP levels."
-              exit 1
-            fi
-            echo "Extracting nested ZIP: $INNER_ZIP"
-            DEST="source/extracted-level-$COUNT"
-            mkdir -p "$DEST"
-            mv "$INNER_ZIP" "/tmp/project-level-$COUNT.zip"
-            unzip -o "/tmp/project-level-$COUNT.zip" -d "$DEST"
+          set -euo pipefail
+          count=0
+          while inner=$(find source -type f -name '*.zip' -print -quit) && [[ -n "$inner" ]]; do
+            count=$((count + 1))
+            [[ $count -le 5 ]] || { echo "ERROR: Too many nested ZIP levels" >&2; exit 1; }
+            dest="source/extracted-level-$count"
+            mkdir -p "$dest"
+            mv "$inner" "/tmp/project-level-$count.zip"
+            unzip -o "/tmp/project-level-$count.zip" -d "$dest"
           done
-          echo "All ZIP extraction completed."
 
       - name: Locate Android project
         id: locate
         shell: bash
         run: |
-          set -e
-          PROJECT_FILE=$(find source -type f \
-            \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) \
-            -print -quit)
-          if [ -z "$PROJECT_FILE" ]; then
-            echo "ERROR: Android Gradle project not found!"
-            echo "Extracted files:"
-            find source -maxdepth 6 -type f | head -200
-            exit 1
-          fi
-          PROJECT_DIR=$(dirname "$PROJECT_FILE")
-          PROJECT_DIR=$(realpath "$PROJECT_DIR")
-          echo "Android project: $PROJECT_DIR"
-          if [ ! -d "$PROJECT_DIR/app" ]; then
-            echo "ERROR: Android app directory not found!"
-            exit 1
-          fi
-          if [ ! -f "$PROJECT_DIR/app/src/main/python/epub_app.py" ]; then
-            echo "NOTE: Native project detected; expected Python file is not present."
-          fi
-          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          echo "apk_path=$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          project_file=$(find source -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)
+          [[ -n "$project_file" ]] || { echo "ERROR: Android project not found" >&2; exit 1; }
+          project_dir=$(realpath "$(dirname "$project_file")")
+          [[ -d "$project_dir/app" ]] || { echo "ERROR: app module missing" >&2; exit 1; }
+          echo "project_dir=$project_dir" >> "$GITHUB_OUTPUT"
+          echo "apk_path=$project_dir/app/build/outputs/apk/debug/app-debug.apk" >> "$GITHUB_OUTPUT"
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -93,50 +65,46 @@ jobs:
         with:
           gradle-version: '8.10.2'
 
-      - name: Install persistent debug signing key
+      - name: Install persistent V5 debug signing key
         shell: bash
         env:
           KEYSTORE_BASE64: ${{ secrets.V5_DEBUG_KEYSTORE_BASE64 }}
         run: |
-          set -e
-          if [ -z "$KEYSTORE_BASE64" ]; then
-            echo "ERROR: Repository secret V5_DEBUG_KEYSTORE_BASE64 is missing."
+          set -euo pipefail
+          if [[ -z "$KEYSTORE_BASE64" ]]; then
+            echo "ERROR: GitHub repository secret V5_DEBUG_KEYSTORE_BASE64 is missing." >&2
             exit 1
           fi
           mkdir -p "$HOME/.android"
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$HOME/.android/debug.keystore"
           chmod 600 "$HOME/.android/debug.keystore"
-          if [ ! -s "$HOME/.android/debug.keystore" ]; then
-            echo "ERROR: Decoded debug keystore is empty."
-            exit 1
-          fi
+          keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey >/dev/null
+          echo "Persistent debug keystore installed and alias validated."
 
-      - name: Build Android APK
+      - name: Build APK
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
-          set -e
-          if [ -f "./gradlew" ]; then
+          set -euo pipefail
+          if [[ -f ./gradlew ]]; then
             chmod +x ./gradlew
             ./gradlew assembleDebug
           else
             gradle assembleDebug
           fi
 
-      - name: Verify APK
+      - name: Verify APK and signing certificate
         shell: bash
         run: |
-          APK="${{ steps.locate.outputs.apk_path }}"
-          if [ ! -f "$APK" ]; then
-            echo "ERROR: APK was not generated!"
-            exit 1
-          fi
-          echo "APK successfully generated."
-          ls -lh "$APK"
+          set -euo pipefail
+          apk="${{ steps.locate.outputs.apk_path }}"
+          [[ -f "$apk" ]] || { echo "ERROR: APK not generated" >&2; exit 1; }
+          apksigner verify --print-certs "$apk"
+          ls -lh "$apk"
 
-      - name: Upload APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: EPUB-Toolkit-v5-APK
+          name: EPUB-Toolkit-V5-APK
           path: ${{ steps.locate.outputs.apk_path }}
           if-no-files-found: error
