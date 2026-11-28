@@ -18,85 +18,99 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 1. AUTOMATICALLY FIND AND EXTRACT SOURCE ZIP
-      - name: Detect and extract Android project
+      # 1. FIND AND EXTRACT ANDROID PROJECT ZIP
+      - name: Find and extract Android project
         shell: bash
         run: |
           set -euo pipefail
 
-          found_source=""
+          FOUND=false
 
-          while IFS= read -r zip_file; do
-            [ -n "$zip_file" ] || continue
+          while IFS= read -r ZIP_FILE; do
+            echo "Checking ZIP: $ZIP_FILE"
 
-            echo "Checking: $zip_file"
+            CANDIDATE="$RUNNER_TEMP/source_candidate"
+            rm -rf "$CANDIDATE"
+            mkdir -p "$CANDIDATE"
 
-            candidate="$RUNNER_TEMP/source_candidate"
-            rm -rf "$candidate"
-            mkdir -p "$candidate"
-
-            if ! unzip -q "$zip_file" -d "$candidate"; then
-              echo "Skipping invalid ZIP."
+            if ! unzip -q "$ZIP_FILE" -d "$CANDIDATE"; then
+              echo "Invalid ZIP. Skipping."
               continue
             fi
 
-            APP_GRADLE="$(find "$candidate" -type f \
+            APP_FILE="$(find "$CANDIDATE" -type f \
               \( -name build.gradle -o -name build.gradle.kts \) \
-              | grep -E '/app/build\.gradle(\.kts)?$' \
+              | grep '/app/build.gradle' \
               | head -n 1 || true)"
 
-            if [ -z "$APP_GRADLE" ]; then
+            if [ -z "$APP_FILE" ]; then
               echo "No app Gradle file found. Skipping."
               continue
             fi
 
-            APP_DIR="$(dirname "$APP_GRADLE")"
-            PROJECT_ROOT="$(dirname "$APP_DIR")"
+            APP_DIR="$(dirname "$APP_FILE")"
 
-            if [ ! -f "$PROJECT_ROOT/settings.gradle" ] && \
-               [ ! -f "$PROJECT_ROOT/settings.gradle.kts" ]; then
-              echo "No Gradle settings file found. Skipping."
+            # Find the project root containing settings.gradle
+            PROJECT_ROOT=""
+
+            CURRENT="$APP_DIR"
+
+            while [ "$CURRENT" != "$CANDIDATE" ] && \
+                  [ "$CURRENT" != "/" ]; do
+
+              if [ -f "$CURRENT/settings.gradle" ] || \
+                 [ -f "$CURRENT/settings.gradle.kts" ]; then
+                PROJECT_ROOT="$CURRENT"
+                break
+              fi
+
+              CURRENT="$(dirname "$CURRENT")"
+            done
+
+            if [ -z "$PROJECT_ROOT" ]; then
+              echo "Gradle settings not found. Skipping."
               continue
             fi
 
-            found_source="$zip_file"
+            echo "Found Android project:"
+            echo "$PROJECT_ROOT"
 
             rm -rf project
             mkdir -p project
-            cp -a "$candidate/." project/
+            cp -a "$PROJECT_ROOT/." project/
 
-            # Recalculate paths after extraction.
-            APP_GRADLE_REL="${APP_GRADLE#"$candidate"/}"
-            PROJECT_ROOT_REL="${PROJECT_ROOT#"$candidate"/}"
+            APP_GRADLE_REL="${APP_FILE#"$PROJECT_ROOT"/}"
+            APP_DIR_REL="$(dirname "$APP_GRADLE_REL")"
 
             echo "APP_GRADLE=project/$APP_GRADLE_REL" >> "$GITHUB_ENV"
-            echo "PROJECT_ROOT=project/$PROJECT_ROOT_REL" >> "$GITHUB_ENV"
+            echo "APP_DIR=project/$APP_DIR_REL" >> "$GITHUB_ENV"
+            echo "PROJECT_ROOT=project" >> "$GITHUB_ENV"
 
+            FOUND=true
             break
 
           done < <(
-            find . -maxdepth 1 -type f -iname '*.zip' -print | sort
+            find "$GITHUB_WORKSPACE" -maxdepth 1 \
+              -type f -iname '*.zip' | sort
           )
 
-          if [ -z "$found_source" ]; then
+          if [ "$FOUND" != "true" ]; then
             echo "::error::No valid Android project ZIP found."
             exit 1
           fi
 
-          echo "========================================"
-          echo "Selected ZIP: $found_source"
-          echo "Android project extracted successfully."
-          echo "========================================"
+          echo "Android source extracted successfully."
 
-      # 2. CONFIGURE PACKAGE ID AND AUTOMATIC VERSION CODE
+      # 2. CONFIGURE PACKAGE AND VERSION
       - name: Configure application ID and version
         shell: bash
         env:
-          VERSION_CODE: ${{ github.run_number }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
 
-          VERSION_CODE=$((100000 + VERSION_CODE))
+          VERSION_CODE=$((100000 + RUN_NUMBER))
+          export VERSION_CODE
 
           python3 <<'PY'
           import os
@@ -112,40 +126,40 @@ jobs:
           is_kotlin = gradle_file.endswith(".kts")
 
           if is_kotlin:
-              app_id_line = f'        applicationId = "{package_id}"'
-              version_line = f'        versionCode = {version_code}'
+              app_id_line = f'applicationId = "{package_id}"'
+              version_line = f'versionCode = {version_code}'
           else:
-              app_id_line = f'        applicationId "{package_id}"'
-              version_line = f'        versionCode {version_code}'
+              app_id_line = f'applicationId "{package_id}"'
+              version_line = f'versionCode {version_code}'
 
-          # Replace existing applicationId.
+          # Update or insert applicationId
           if re.search(r'(?m)^\s*applicationId\s*(?:=)?\s*["\'].*?["\']', content):
               content = re.sub(
                   r'(?m)^\s*applicationId\s*(?:=)?\s*["\'].*?["\'].*$',
-                  app_id_line,
+                  "        " + app_id_line,
                   content,
                   count=1
               )
           else:
               content = re.sub(
                   r'(defaultConfig\s*\{)',
-                  r'\1\n' + app_id_line,
+                  r'\1\n        ' + app_id_line,
                   content,
                   count=1
               )
 
-          # Replace existing versionCode.
+          # Update or insert versionCode
           if re.search(r'(?m)^\s*versionCode\s*(?:=)?\s*\d+', content):
               content = re.sub(
                   r'(?m)^\s*versionCode\s*(?:=)?\s*\d+.*$',
-                  version_line,
+                  "        " + version_line,
                   content,
                   count=1
               )
           else:
               content = re.sub(
                   r'(defaultConfig\s*\{)',
-                  r'\1\n' + version_line,
+                  r'\1\n        ' + version_line,
                   content,
                   count=1
               )
@@ -153,11 +167,11 @@ jobs:
           with open(gradle_file, "w", encoding="utf-8") as f:
               f.write(content)
 
-          print("Application ID:", package_id)
+          print("Package:", package_id)
           print("Version code:", version_code)
           PY
 
-      # 3. JAVA 17
+      # 3. JAVA
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
@@ -169,14 +183,15 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Install Android SDK
+        shell: bash
         run: |
           sdkmanager \
             "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0"
 
-      # 5. INSTALL GRADLE WITHOUT DEPENDING ON ZIP WRAPPER
-      - name: Install Gradle 8.7
+      # 5. INSTALL GRADLE
+      - name: Install Gradle
         shell: bash
         run: |
           set -euo pipefail
@@ -190,8 +205,6 @@ jobs:
           unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
 
           echo "$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
-
-          echo "Gradle ${GRADLE_VERSION} installed."
 
       # 6. RESTORE PERSISTENT SIGNING KEY
       - name: Restore signing keystore
@@ -221,15 +234,11 @@ jobs:
 
           gradle --no-daemon assembleDebug
 
-          APK_PATH="$(
-            find app/build/outputs/apk \
-              -type f -name '*.apk' \
-              | sort \
-              | head -n 1
-          )"
+          APK_PATH="$(find "$APP_DIR/build/outputs/apk" \
+            -type f -name '*.apk' | head -n 1 || true)"
 
           if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
-            echo "::error::APK was not generated."
+            echo "::error::APK not found after build."
             exit 1
           fi
 
@@ -237,7 +246,7 @@ jobs:
 
           cp "$APK_PATH" "$GITHUB_WORKSPACE/output/app-unsigned.apk"
 
-          echo "APK build successful."
+          echo "APK built successfully."
 
       # 8. SIGN APK
       - name: Sign APK with persistent certificate
@@ -255,7 +264,7 @@ jobs:
             --out "$GITHUB_WORKSPACE/output/app.apk" \
             "$GITHUB_WORKSPACE/output/app-unsigned.apk"
 
-      # 9. VERIFY SIGNATURE
+      # 9. VERIFY APK SIGNATURE
       - name: Verify APK signature
         shell: bash
         run: |
@@ -266,8 +275,8 @@ jobs:
             --print-certs \
             "$GITHUB_WORKSPACE/output/app.apk"
 
-      # 10. VERIFY PERSISTENT CERTIFICATE
-      - name: Verify signing certificate fingerprint
+      # 10. VERIFY CERTIFICATE
+      - name: Verify persistent signing certificate
         shell: bash
         run: |
           set -euo pipefail
@@ -278,12 +287,10 @@ jobs:
             "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify \
               --print-certs "$GITHUB_WORKSPACE/output/app.apk" \
               | grep 'Signer #1 certificate SHA-256 digest' \
-              | head -n 1 \
               | awk '{print $NF}' \
-              | tr -d ':'
+              | tr -d ':' \
+              | tr '[:upper:]' '[:lower:]'
           )"
-
-          ACTUAL="$(echo "$ACTUAL" | tr '[:upper:]' '[:lower:]')"
 
           echo "Expected: $EXPECTED"
           echo "Actual:   $ACTUAL"
@@ -296,17 +303,15 @@ jobs:
           echo "Persistent signing certificate verified."
 
       # 11. VERIFY PACKAGE ID
-      - name: Verify APK package ID
+      - name: Verify package ID
         shell: bash
         run: |
           set -euo pipefail
 
-          APK="$GITHUB_WORKSPACE/output/app.apk"
-
           PACKAGE="$(
-            "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" \
-              | grep "^package:" \
-              | head -n 1 \
+            "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging \
+              "$GITHUB_WORKSPACE/output/app.apk" \
+              | grep '^package:' \
               | sed -n "s/.*name='\([^']*\)'.*/\1/p"
           )"
 
@@ -322,8 +327,8 @@ jobs:
 
           echo "Package ID verified."
 
-      # 12. UPLOAD APK ARTIFACT BACKUP
-      - name: Upload APK backup
+      # 12. UPLOAD APK ARTIFACT
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: EPUB-Toolkit-V5-APK
@@ -331,7 +336,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # 13. AUTOMATIC GITHUB RELEASE
+      # 13. CREATE RELEASE
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -342,11 +347,12 @@ jobs:
           body: |
             Automated APK build.
 
-            - APK built successfully.
+            - APK compiled successfully.
             - Signed using the persistent signing certificate.
+            - Signing certificate verified.
             - Package ID verified.
 
-            Download app.apk below to install.
+            Download app.apk to install.
           files: output/app.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
