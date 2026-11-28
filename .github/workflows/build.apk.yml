@@ -1,4 +1,4 @@
-
+```yaml
 name: Build APK
 
 on:
@@ -18,6 +18,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 1. EXTRACT ANDROID PROJECT FROM ZIP
       - name: Extract Android project from ZIP
         shell: bash
         run: |
@@ -32,37 +33,58 @@ jobs:
 
           echo "Source ZIP: $ZIP_FILE"
 
-          rm -rf "$RUNNER_TEMP/android_source"
-          mkdir -p "$RUNNER_TEMP/android_source"
-
-          unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/android_source"
-
           SOURCE_ROOT="$RUNNER_TEMP/android_source"
+          rm -rf "$SOURCE_ROOT"
+          mkdir -p "$SOURCE_ROOT"
 
-          if [ ! -f "$SOURCE_ROOT/settings.gradle" ] && \
-             [ ! -f "$SOURCE_ROOT/settings.gradle.kts" ]; then
-            echo "::error::settings.gradle not found at ZIP root."
+          unzip -q "$ZIP_FILE" -d "$SOURCE_ROOT"
+
+          APP_GRADLE_FILE="$(find "$SOURCE_ROOT" -type f \
+            \( -name build.gradle -o -name build.gradle.kts \) \
+            | grep '/app/build.gradle' \
+            | head -n 1 || true)"
+
+          if [ -z "$APP_GRADLE_FILE" ]; then
+            echo "::error::Android app Gradle file not found inside ZIP."
             exit 1
           fi
 
-          if [ ! -f "$SOURCE_ROOT/app/build.gradle" ] && \
-             [ ! -f "$SOURCE_ROOT/app/build.gradle.kts" ]; then
-            echo "::error::app/build.gradle not found."
+          APP_DIR="$(dirname "$APP_GRADLE_FILE")"
+          PROJECT_ROOT=""
+
+          CURRENT="$APP_DIR"
+
+          while [ "$CURRENT" != "$SOURCE_ROOT" ] && [ "$CURRENT" != "/" ]; do
+            if [ -f "$CURRENT/settings.gradle" ] || \
+               [ -f "$CURRENT/settings.gradle.kts" ]; then
+              PROJECT_ROOT="$CURRENT"
+              break
+            fi
+
+            CURRENT="$(dirname "$CURRENT")"
+          done
+
+          if [ -z "$PROJECT_ROOT" ]; then
+            echo "::error::Android project root could not be identified."
             exit 1
           fi
 
           rm -rf "$GITHUB_WORKSPACE/project"
           mkdir -p "$GITHUB_WORKSPACE/project"
 
-          cp -a "$SOURCE_ROOT/." "$GITHUB_WORKSPACE/project/"
+          cp -a "$PROJECT_ROOT/." "$GITHUB_WORKSPACE/project/"
+
+          APP_GRADLE_REL="${APP_GRADLE_FILE#"$PROJECT_ROOT"/}"
+          APP_DIR_REL="$(dirname "$APP_GRADLE_REL")"
 
           echo "PROJECT_ROOT=$GITHUB_WORKSPACE/project" >> "$GITHUB_ENV"
-          echo "APP_DIR=$GITHUB_WORKSPACE/project/app" >> "$GITHUB_ENV"
-          echo "APP_GRADLE=$GITHUB_WORKSPACE/project/app/build.gradle" >> "$GITHUB_ENV"
+          echo "APP_DIR=$GITHUB_WORKSPACE/project/$APP_DIR_REL" >> "$GITHUB_ENV"
+          echo "APP_GRADLE=$GITHUB_WORKSPACE/project/$APP_GRADLE_REL" >> "$GITHUB_ENV"
 
-          echo "Android project found successfully."
-          echo "Project root: $GITHUB_WORKSPACE/project"
+          echo "Android project extracted successfully."
+          echo "Project root: $PROJECT_ROOT"
 
+      # 2. CONFIGURE PACKAGE ID AND VERSION
       - name: Configure application ID and version
         shell: bash
         env:
@@ -70,39 +92,48 @@ jobs:
         run: |
           set -euo pipefail
 
-          VERSION_CODE=$((100000 + RUN_NUMBER))
-
           python3 <<'PY'
           import os
           import re
 
           gradle_file = os.environ["APP_GRADLE"]
-          version_code = os.environ["RUN_NUMBER"]
-          version_code = str(100000 + int(version_code))
+          version_code = 100000 + int(os.environ["RUN_NUMBER"])
           package_id = "com.rdustt21.epubtoolkit.v5"
 
           with open(gradle_file, "r", encoding="utf-8") as f:
               content = f.read()
 
-          content, app_id_count = re.subn(
-              r"applicationId\s+['\"][^'\"]+['\"]",
-              f"applicationId '{package_id}'",
+          is_kotlin = gradle_file.endswith(".kts")
+
+          app_id_pattern = r'(?m)^\s*applicationId\s*(?:=\s*)?["\'][^"\']+["\']'
+          version_pattern = r'(?m)^\s*versionCode\s*(?:=\s*)?\d+'
+
+          if is_kotlin:
+              app_id_replacement = f'applicationId = "{package_id}"'
+              version_replacement = f'versionCode = {version_code}'
+          else:
+              app_id_replacement = f'applicationId "{package_id}"'
+              version_replacement = f'versionCode {version_code}'
+
+          content, app_count = re.subn(
+              app_id_pattern,
+              app_id_replacement,
               content,
               count=1
           )
 
           content, version_count = re.subn(
-              r"versionCode\s+\d+",
-              f"versionCode {version_code}",
+              version_pattern,
+              version_replacement,
               content,
               count=1
           )
 
-          if app_id_count == 0:
-              raise SystemExit("applicationId could not be updated.")
+          if app_count == 0:
+              raise SystemExit("Could not locate applicationId in app Gradle file.")
 
           if version_count == 0:
-              raise SystemExit("versionCode could not be updated.")
+              raise SystemExit("Could not locate versionCode in app Gradle file.")
 
           with open(gradle_file, "w", encoding="utf-8") as f:
               f.write(content)
@@ -111,14 +142,18 @@ jobs:
           print("Version code:", version_code)
           PY
 
+      # 3. JAVA
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
+      # 4. ANDROID SDK - FIXED
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
 
       - name: Install Android SDK components
         shell: bash
@@ -126,10 +161,10 @@ jobs:
           set -euo pipefail
 
           sdkmanager \
-            "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0"
 
+      # 5. INSTALL GRADLE
       - name: Install Gradle 8.7
         shell: bash
         run: |
@@ -145,6 +180,7 @@ jobs:
 
           echo "$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
 
+      # 6. RESTORE PERSISTENT SIGNING KEY
       - name: Restore persistent signing keystore
         shell: bash
         env:
@@ -162,6 +198,7 @@ jobs:
 
           echo "KEYSTORE_PATH=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
 
+      # 7. BUILD APK
       - name: Build APK
         shell: bash
         run: |
@@ -185,6 +222,7 @@ jobs:
 
           echo "APK build completed."
 
+      # 8. SIGN APK
       - name: Sign APK using persistent certificate
         shell: bash
         run: |
@@ -200,6 +238,7 @@ jobs:
             --out "$GITHUB_WORKSPACE/output/app.apk" \
             "$GITHUB_WORKSPACE/output/app-unsigned.apk"
 
+      # 9. VERIFY APK SIGNATURE
       - name: Verify APK signature
         shell: bash
         run: |
@@ -210,6 +249,7 @@ jobs:
             --print-certs \
             "$GITHUB_WORKSPACE/output/app.apk"
 
+      # 10. VERIFY PERSISTENT CERTIFICATE
       - name: Verify persistent signing certificate
         shell: bash
         run: |
@@ -236,6 +276,7 @@ jobs:
 
           echo "Persistent signing certificate verified."
 
+      # 11. VERIFY PACKAGE ID
       - name: Verify package ID
         shell: bash
         run: |
@@ -260,6 +301,7 @@ jobs:
 
           echo "Package ID verified."
 
+      # 12. UPLOAD APK
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
@@ -268,6 +310,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      # 13. CREATE RELEASE
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -287,3 +330,4 @@ jobs:
           files: output/app.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
