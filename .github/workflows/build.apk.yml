@@ -67,23 +67,18 @@ jobs:
           with open(path, "r", encoding="utf-8") as f:
               content = f.read()
 
-          # Configure application ID (Groovy and Kotlin DSL)
           app_pattern = r'(applicationId\s*(?:=\s*)?)(["\'])([^"\']+)(\2)'
 
           content, app_count = re.subn(
               app_pattern,
-              lambda m: m.group(1) + '"' +
-                  'com.rdustt21.epubtoolkit.v5' + '"',
+              lambda m: m.group(1) + '"com.rdustt21.epubtoolkit.v5"',
               content,
               count=1
           )
 
           if app_count != 1:
-              raise SystemExit(
-                  "ERROR: Could not safely configure applicationId."
-              )
+              raise SystemExit("ERROR: Could not configure applicationId.")
 
-          # Configure version code
           version_pattern = r'(versionCode\s*(?:=\s*)?)\d+'
 
           content, version_count = re.subn(
@@ -94,9 +89,7 @@ jobs:
           )
 
           if version_count != 1:
-              raise SystemExit(
-                  "ERROR: Could not safely configure versionCode."
-              )
+              raise SystemExit("ERROR: Could not configure versionCode.")
 
           with open(path, "w", encoding="utf-8") as f:
               f.write(content)
@@ -106,7 +99,7 @@ jobs:
           PY
 
       # ==========================================
-      # 3. JAVA
+      # 3. SET UP JAVA
       # ==========================================
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -115,7 +108,15 @@ jobs:
           java-version: 17
 
       # ==========================================
-      # 4. ANDROID SDK — FIXED
+      # 4. SET UP GRADLE
+      # ==========================================
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      # ==========================================
+      # 5. SET UP ANDROID SDK
       # ==========================================
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
@@ -130,7 +131,7 @@ jobs:
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
       # ==========================================
-      # 5. RESTORE PERSISTENT KEYSTORE
+      # 6. RESTORE PERSISTENT KEYSTORE
       # ==========================================
       - name: Restore persistent signing key
         shell: bash
@@ -157,30 +158,48 @@ jobs:
           echo "Persistent keystore restored."
 
       # ==========================================
-      # 6. BUILD APK
+      # 7. BUILD APK
       # ==========================================
       - name: Build APK
         shell: bash
         run: |
           set -euo pipefail
 
-          GRADLE_WRAPPER="$(find project -type f -name gradlew | head -n 1)"
+          APP_GRADLE="$(find project -type f \
+            \( -name build.gradle -o -name build.gradle.kts \) \
+            | grep '/app/build.gradle' \
+            | head -n 1)"
 
-          if [ -z "$GRADLE_WRAPPER" ]; then
-            echo "::error::Gradle wrapper not found."
+          if [ -z "$APP_GRADLE" ]; then
+            echo "::error::App Gradle file not found."
             exit 1
           fi
 
-          PROJECT_ROOT="$(dirname "$GRADLE_WRAPPER")"
+          APP_DIR="$(dirname "$APP_GRADLE")"
+          PROJECT_ROOT="$(dirname "$APP_DIR")"
 
-          cd "$PROJECT_ROOT"
+          echo "App directory: $APP_DIR"
+          echo "Gradle project root: $PROJECT_ROOT"
 
-          chmod +x gradlew
+          if [ -f "$PROJECT_ROOT/gradlew" ]; then
+            echo "Using project Gradle wrapper."
+            chmod +x "$PROJECT_ROOT/gradlew"
+            "$PROJECT_ROOT/gradlew" \
+              -p "$PROJECT_ROOT" \
+              assembleDebug \
+              --no-daemon
+          else
+            echo "Gradle wrapper not present."
+            echo "Using installed Gradle 8.7."
 
-          ./gradlew assembleDebug --no-daemon
+            gradle \
+              -p "$PROJECT_ROOT" \
+              assembleDebug \
+              --no-daemon
+          fi
 
       # ==========================================
-      # 7. SIGN FINAL APK WITH PERSISTENT KEY
+      # 8. SIGN FINAL APK WITH PERSISTENT KEY
       # ==========================================
       - name: Enforce persistent APK signing certificate
         shell: bash
@@ -272,7 +291,7 @@ jobs:
           echo "=========================================="
 
       # ==========================================
-      # 8. VERIFY PACKAGE ID
+      # 9. VERIFY PACKAGE ID
       # ==========================================
       - name: Verify APK identity
         shell: bash
@@ -305,7 +324,7 @@ jobs:
           echo "=========================================="
 
       # ==========================================
-      # 9. UPLOAD VERIFIED APK
+      # 10. UPLOAD VERIFIED APK
       # ==========================================
       - name: Upload APK
         uses: actions/upload-artifact@v4
