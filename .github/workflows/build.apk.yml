@@ -1,0 +1,193 @@
+
+name: Build V5 - Verified Source
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select V5 source ZIP
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, zipfile, tempfile, os, re, shutil
+
+          APP_ID = "com.rdustt21.epubtoolkit.v5"
+          candidates = []
+          temp_dirs = []
+          diagnostics = []
+
+          def locate_project_root(extraction):
+              for root, dirs, files in os.walk(extraction):
+                  if not ({"settings.gradle", "settings.gradle.kts"} & set(files)):
+                      continue
+                  app_gradle = next((os.path.join(root, "app", f)
+                      for f in ("build.gradle", "build.gradle.kts")
+                      if os.path.isfile(os.path.join(root, "app", f))), None)
+                  if app_gradle:
+                      return root, app_gradle
+              return None, None
+
+          def extract(pattern, content):
+              match = re.search(pattern, content, re.MULTILINE)
+              return match.group(1).strip() if match else None
+
+          for z in sorted(glob.glob("*.zip")):
+              tmp = tempfile.mkdtemp(prefix="epub-source-")
+              temp_dirs.append(tmp)
+              try:
+                  with zipfile.ZipFile(z) as archive:
+                      archive.extractall(tmp)
+
+                  root, gradle_file = locate_project_root(tmp)
+                  if not root:
+                      diagnostics.append(f"{z}: no Android Gradle project/app module found")
+                      continue
+
+                  with open(gradle_file, encoding="utf-8") as source:
+                      content = source.read()
+
+                  appid = extract(r"applicationId\s*(?:=\s*)?['\"]([^'\"]+)['\"]", content)
+                  code = extract(r"versionCode\s*(?:=\s*)?(\d+)", content)
+                  name = extract(r"versionName\s*(?:=\s*)?['\"]([^'\"]+)['\"]", content)
+
+                  if appid != APP_ID:
+                      diagnostics.append(f"{z}: package mismatch/missing ({appid!r})")
+                      continue
+                  if not code or not name:
+                      diagnostics.append(f"{z}: versionCode/versionName missing or not recognized")
+                      continue
+
+                  candidates.append({
+                      "zip": z, "root": root,
+                      "code": int(code), "name": name
+                  })
+              except Exception as error:
+                  diagnostics.append(f"{z}: inspection failed: {error}")
+
+          if not candidates:
+              print("Source ZIP diagnostics:")
+              for message in diagnostics:
+                  print(" -", message)
+              for tmp in temp_dirs:
+                  shutil.rmtree(tmp, ignore_errors=True)
+              raise SystemExit("STOP: No compatible V5 Android source ZIP found.")
+
+          candidates.sort(key=lambda item: (item["code"], item["zip"]), reverse=True)
+          selected = candidates[0]
+          print("SELECTED SOURCE ZIP:", selected["zip"])
+          print("PROJECT ROOT:", selected["root"])
+          print("VERSION NAME:", selected["name"])
+          print("VERSION CODE:", selected["code"])
+          print("Other compatible ZIP candidates:", len(candidates) - 1)
+
+          shutil.rmtree("project", ignore_errors=True)
+          shutil.copytree(selected["root"], "project")
+          for tmp in temp_dirs:
+              shutil.rmtree(tmp, ignore_errors=True)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("version_name=" + selected["name"] + "\n")
+              output.write("version_code=" + str(selected["code"]) + "\n")
+          PY
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Install persistent signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.V5_DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_BASE64"
+          mkdir -p "$HOME/.android"
+          printf '%s' "$KEYSTORE_BASE64" \
+            | base64 --decode > "$HOME/.android/debug.keystore"
+          chmod 600 "$HOME/.android/debug.keystore"
+
+          keytool -list \
+            -keystore "$HOME/.android/debug.keystore" \
+            -storepass android \
+            -alias androiddebugkey
+
+      - name: Build APK
+        working-directory: project
+        run: |
+          set -euo pipefail
+          gradle assembleDebug
+
+      - name: Verify APK identity and version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="project/app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$APK"
+
+          BUILD_TOOLS=$(find "$ANDROID_HOME/build-tools" \
+            -mindepth 1 -maxdepth 1 -type d \
+            | sort -V | tail -n 1)
+
+          AAPT="$BUILD_TOOLS/aapt"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+
+          BADGING=$("$AAPT" dump badging "$APK")
+          echo "$BADGING" | grep "^package:"
+
+          echo "$BADGING" | grep -F \
+            "name='com.rdustt21.epubtoolkit.v5'" >/dev/null
+
+          echo "$BADGING" | grep -F \
+            "versionCode='${{ steps.source.outputs.version_code }}'" >/dev/null
+
+          echo "$BADGING" | grep -F \
+            "versionName='${{ steps.source.outputs.version_name }}'" >/dev/null
+
+          "$APKSIGNER" verify --print-certs "$APK"
+
+          echo "APK VERIFIED"
+          ls -lh "$APK"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: EPUB-Toolkit-V5-${{ steps.source.outputs.version_name }}
+          path: project/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Publish APK Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: verified-v${{ steps.source.outputs.version_name }}-${{ github.run_id }}
+          name: EPUB Toolkit V5 ${{ steps.source.outputs.version_name }}
+          prerelease: true
+          generate_release_notes: false
+          body: |
+            Verified APK.
+            Source version: ${{ steps.source.outputs.version_name }}
+            Source versionCode: ${{ steps.source.outputs.version_code }}
+          files: project/app/build/outputs/apk/debug/app-debug.apk
