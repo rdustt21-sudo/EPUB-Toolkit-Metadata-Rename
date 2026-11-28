@@ -1,5 +1,5 @@
 
-name: Build APK - Persistent Signing
+name: Build APK
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -18,111 +18,132 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 1. EXTRACT SOURCE
-      - name: Extract V5 source
+      # 1. AUTOMATICALLY FIND AND EXTRACT ANDROID SOURCE ZIP
+      - name: Find and extract Android source ZIP
         shell: bash
         run: |
           set -euo pipefail
 
-          SOURCE_ZIP="EPUB-Toolkit-V5.0.24-Safe-Import-Cleanup.zip"
+          found_source=""
 
-          if [ ! -f "$SOURCE_ZIP" ]; then
-            echo "::error::Source ZIP not found: $SOURCE_ZIP"
+          while IFS= read -r zip_file; do
+            [ -n "$zip_file" ] || continue
+
+            echo "Checking ZIP: $zip_file"
+
+            candidate="$RUNNER_TEMP/source_candidate"
+            rm -rf "$candidate"
+            mkdir -p "$candidate"
+
+            if ! unzip -q "$zip_file" -d "$candidate"; then
+              echo "Skipping invalid ZIP: $zip_file"
+              continue
+            fi
+
+            gradle_file="$(
+              find "$candidate" -type f \
+                \( -name build.gradle -o -name build.gradle.kts \) \
+                | grep -E '/app/build\.gradle(\.kts)?$' \
+                | head -n 1 || true
+            )"
+
+            if [ -z "$gradle_file" ]; then
+              echo "No Android app Gradle file found. Skipping."
+              continue
+            fi
+
+            app_dir="$(dirname "$gradle_file")"
+            project_root="$(dirname "$app_dir")"
+
+            if [ ! -f "$project_root/gradlew" ]; then
+              echo "No Gradle wrapper found. Skipping."
+              continue
+            fi
+
+            found_source="$zip_file"
+
+            rm -rf project
+            mkdir -p project
+            cp -a "$candidate/." project/
+
+            break
+
+          done < <(
+            find . -maxdepth 1 -type f -iname '*.zip' -print | sort
+          )
+
+          if [ -z "$found_source" ]; then
+            echo "::error::No valid Android source ZIP found."
             exit 1
           fi
 
-          mkdir -p project
-          unzip -q "$SOURCE_ZIP" -d project
-
-          echo "Source extracted successfully."
+          echo "Selected source ZIP: $found_source"
+          echo "Android source successfully extracted."
 
       # 2. CONFIGURE APPLICATION ID AND VERSION
-      - name: Configure application identity
+      - name: Configure application ID and version
         shell: bash
         run: |
           set -euo pipefail
 
-          GRADLE_FILE="$(find project -type f \
-            \( -name build.gradle -o -name build.gradle.kts \) \
-            | grep '/app/build.gradle' \
-            | head -n 1 || true)"
+          APP_GRADLE="$(
+            find project -type f \
+              \( -path '*/app/build.gradle' \
+              -o -path '*/app/build.gradle.kts' \) \
+              | head -n 1
+          )"
 
-          if [ -z "$GRADLE_FILE" ]; then
+          if [ -z "$APP_GRADLE" ]; then
             echo "::error::App Gradle file not found."
             exit 1
           fi
 
-          python3 - "$GRADLE_FILE" <<'PY'
-          import re
-          import sys
+          PROJECT_ROOT="$(dirname "$(dirname "$APP_GRADLE")")"
 
-          path = sys.argv[1]
+          echo "APP_GRADLE=$APP_GRADLE" >> "$GITHUB_ENV"
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
 
-          with open(path, "r", encoding="utf-8") as f:
-              content = f.read()
+          if [[ "$APP_GRADLE" == *.gradle.kts ]]; then
+            sed -i -E \
+              's/^[[:space:]]*applicationId[[:space:]]*=.*/        applicationId = "com.rdustt21.epubtoolkit.v5"/' \
+              "$APP_GRADLE"
 
-          app_pattern = r'(applicationId\s*(?:=\s*)?)(["\'])([^"\']+)(\2)'
+            sed -i -E \
+              's/^[[:space:]]*versionCode[[:space:]]*=.*/        versionCode = 100011/' \
+              "$APP_GRADLE"
+          else
+            sed -i -E \
+              's/^[[:space:]]*applicationId[[:space:]].*/        applicationId "com.rdustt21.epubtoolkit.v5"/' \
+              "$APP_GRADLE"
 
-          content, app_count = re.subn(
-              app_pattern,
-              lambda m: m.group(1) + '"com.rdustt21.epubtoolkit.v5"',
-              content,
-              count=1
-          )
+            sed -i -E \
+              's/^[[:space:]]*versionCode[[:space:]].*/        versionCode 100011/' \
+              "$APP_GRADLE"
+          fi
 
-          if app_count != 1:
-              raise SystemExit("ERROR: Could not configure applicationId.")
+          echo "Application ID configured."
+          echo "Version code configured."
 
-          version_pattern = r'(versionCode\s*(?:=\s*)?)\d+'
-
-          content, version_count = re.subn(
-              version_pattern,
-              lambda m: m.group(1) + '100011',
-              content,
-              count=1
-          )
-
-          if version_count != 1:
-              raise SystemExit("ERROR: Could not configure versionCode.")
-
-          with open(path, "w", encoding="utf-8") as f:
-              f.write(content)
-
-          print("Application ID configured.")
-          print("Version code configured.")
-          PY
-
-      # 3. SET UP JAVA
-      - name: Set up Java 17
+      # 3. JAVA
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
 
-      # 4. SET UP GRADLE
-      - name: Set up Gradle 8.7
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.7'
-
-      # 5. SET UP ANDROID SDK
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: platform-tools
+      # 4. ANDROID SDK
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
       - name: Install Android SDK components
-        shell: bash
         run: |
-          set -euo pipefail
-
           sdkmanager \
             "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0"
 
-      # 6. RESTORE PERSISTENT KEYSTORE
-      - name: Restore persistent signing key
+      # 5. RESTORE PERSISTENT SIGNING KEY
+      - name: Restore signing keystore
         shell: bash
         env:
           KEYSTORE_BASE64: ${{ secrets.V5_DEBUG_KEYSTORE_BASE64 }}
@@ -134,174 +155,159 @@ jobs:
             exit 1
           fi
 
-          mkdir -p "$HOME/.android"
+          echo "$KEYSTORE_BASE64" | base64 --decode \
+            > "$RUNNER_TEMP/release.keystore"
 
-          printf '%s' "$KEYSTORE_BASE64" \
-            | base64 --decode \
-            > "$HOME/.android/debug.keystore"
+          echo "KEYSTORE_PATH=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
 
-          chmod 600 "$HOME/.android/debug.keystore"
-
-          test -s "$HOME/.android/debug.keystore"
-
-          echo "Persistent keystore restored."
-
-      # 7. BUILD APK
+      # 6. BUILD APK
       - name: Build APK
         shell: bash
         run: |
           set -euo pipefail
 
-          APP_GRADLE="$(find project -type f \
-            \( -name build.gradle -o -name build.gradle.kts \) \
-            | grep '/app/build.gradle' \
-            | head -n 1 || true)"
+          cd "$PROJECT_ROOT"
 
-          if [ -z "$APP_GRADLE" ]; then
-            echo "::error::App Gradle file not found."
+          chmod +x gradlew
+
+          ./gradlew --no-daemon assembleDebug
+
+          APK_PATH="$(
+            find app/build/outputs/apk \
+              -type f -name '*.apk' \
+              | sort \
+              | head -n 1
+          )"
+
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::APK was not generated."
             exit 1
           fi
 
-          APP_DIR="$(dirname "$APP_GRADLE")"
-          PROJECT_ROOT="$(dirname "$APP_DIR")"
+          mkdir -p "$GITHUB_WORKSPACE/output"
 
-          if [ -f "$PROJECT_ROOT/gradlew" ]; then
-            chmod +x "$PROJECT_ROOT/gradlew"
+          cp "$APK_PATH" "$GITHUB_WORKSPACE/output/app-unsigned.apk"
 
-            "$PROJECT_ROOT/gradlew" \
-              -p "$PROJECT_ROOT" \
-              assembleDebug \
-              --no-daemon
-          else
-            gradle \
-              -p "$PROJECT_ROOT" \
-              assembleDebug \
-              --no-daemon
-          fi
-
-      # 8. SIGN AND VERIFY PERSISTENT CERTIFICATE
-      - name: Enforce persistent APK signing certificate
+      # 7. SIGN APK
+      - name: Sign APK
         shell: bash
         run: |
           set -euo pipefail
 
-          APK="$(find project -type f \
-            -path '*/app/build/outputs/apk/debug/app-debug.apk' \
-            | head -n 1 || true)"
-
-          KEYSTORE="$HOME/.android/debug.keystore"
           BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
-          APKSIGNER="$BUILD_TOOLS/apksigner"
 
-          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
-            echo "::error::Built APK not found."
-            exit 1
-          fi
-
-          if [ ! -f "$APKSIGNER" ]; then
-            echo "::error::apksigner not found: $APKSIGNER"
-            exit 1
-          fi
-
-          # Extract persistent key fingerprint
-          KEY_CERT_SHA256="$(keytool -exportcert \
-            -keystore "$KEYSTORE" \
-            -storepass android \
-            -alias androiddebugkey \
-            | openssl dgst -sha256 \
-            | awk '{print $2}' \
-            | tr '[:upper:]' '[:lower:]')"
-
-          if [ -z "$KEY_CERT_SHA256" ]; then
-            echo "::error::Could not extract keystore fingerprint."
-            exit 1
-          fi
-
-          echo "Persistent certificate:"
-          echo "$KEY_CERT_SHA256"
-
-          # Sign APK using persistent key
-          "$APKSIGNER" sign \
-            --ks "$KEYSTORE" \
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks "$KEYSTORE_PATH" \
             --ks-key-alias androiddebugkey \
             --ks-pass pass:android \
             --key-pass pass:android \
-            --v1-signing-enabled true \
-            --v2-signing-enabled true \
-            --v3-signing-enabled true \
-            "$APK"
+            --out "$GITHUB_WORKSPACE/output/app.apk" \
+            "$GITHUB_WORKSPACE/output/app-unsigned.apk"
 
-          # Verify APK signature
-          "$APKSIGNER" verify --verbose --print-certs "$APK"
-
-          # Extract APK certificate fingerprint
-          APK_CERT_SHA256="$("$APKSIGNER" verify \
-            --print-certs "$APK" \
-            | grep 'certificate SHA-256 digest:' \
-            | head -n 1 \
-            | sed 's/^.*digest:[[:space:]]*//' \
-            | tr -d ':' \
-            | tr '[:upper:]' '[:lower:]')"
-
-          echo "APK certificate:"
-          echo "$APK_CERT_SHA256"
-
-          if [ -z "$APK_CERT_SHA256" ]; then
-            echo "::error::Could not extract APK certificate fingerprint."
-            exit 1
-          fi
-
-          # Compare fingerprints
-          if [ "$KEY_CERT_SHA256" != "$APK_CERT_SHA256" ]; then
-            echo "::error::APK certificate does not match persistent keystore."
-            exit 1
-          fi
-
-          echo "CERTIFICATE MATCH CONFIRMED"
-
-      # 9. VERIFY APK PACKAGE ID
-      - name: Verify APK identity
+      # 8. VERIFY SIGNATURE
+      - name: Verify APK signature
         shell: bash
         run: |
           set -euo pipefail
 
-          APK="$(find project -type f \
-            -path '*/app/build/outputs/apk/debug/app-debug.apk' \
-            | head -n 1 || true)"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify \
+            --verbose \
+            --print-certs \
+            "$GITHUB_WORKSPACE/output/app.apk"
 
-          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
+      # 9. VERIFY PERSISTENT CERTIFICATE
+      - name: Verify persistent signing certificate
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
-            echo "::error::APK not found for identity verification."
+          EXPECTED="1e3839d0f823fc8c7fcd2888cd8901942e56b5e663995040aefabb104fde006a"
+
+          ACTUAL="$(
+            "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify \
+              --print-certs "$GITHUB_WORKSPACE/output/app.apk" \
+              | grep 'Signer #1 certificate SHA-256 digest' \
+              | head -n 1 \
+              | awk '{print $NF}' \
+              | tr -d ':'
+          )"
+
+          ACTUAL="$(echo "$ACTUAL" | tr '[:upper:]' '[:lower:]')"
+
+          echo "Expected: $EXPECTED"
+          echo "Actual:   $ACTUAL"
+
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Signing certificate mismatch!"
             exit 1
           fi
 
-          if [ ! -f "$AAPT" ]; then
-            echo "::error::aapt not found: $AAPT"
-            exit 1
-          fi
+          echo "Persistent certificate verified."
 
-          APK_PACKAGE="$("$AAPT" dump badging "$APK" \
-            | awk -F"'" '/^package: name=/{print $2; exit}')"
+      # 10. VERIFY PACKAGE ID
+      - name: Verify APK package ID
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          EXPECTED_PACKAGE="com.rdustt21.epubtoolkit.v5"
+          APK="$GITHUB_WORKSPACE/output/app.apk"
 
-          echo "Detected package: $APK_PACKAGE"
-          echo "Expected package: $EXPECTED_PACKAGE"
+          PACKAGE="$(
+            "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" \
+              | grep "^package:" \
+              | head -n 1 \
+              | sed -n "s/.*name='\([^']*\)'.*/\1/p"
+          )"
 
-          if [ "$APK_PACKAGE" != "$EXPECTED_PACKAGE" ]; then
-            echo "::error::Wrong APK package ID: $APK_PACKAGE"
+          EXPECTED="com.rdustt21.epubtoolkit.v5"
+
+          echo "Expected: $EXPECTED"
+          echo "Actual:   $PACKAGE"
+
+          if [ "$PACKAGE" != "$EXPECTED" ]; then
+            echo "::error::Unexpected package ID!"
             exit 1
           fi
 
           echo "Package ID verified."
-          echo "FINAL APK VERIFICATION PASSED"
 
-      # 10. UPLOAD VERIFIED APK
-      - name: Upload APK
+      # 11. LOCATE FINAL APK
+      - name: Locate APK
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="$GITHUB_WORKSPACE/output/app.apk"
+
+          if [ ! -f "$APK" ]; then
+            echo "::error::Final APK not found."
+            exit 1
+          fi
+
+          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
+
+      # 12. BACKUP APK ARTIFACT
+      - name: Upload APK backup artifact
         uses: actions/upload-artifact@v4
         with:
-          name: EPUB-Toolkit-V5-Signed
-          path: project/**/app/build/outputs/apk/debug/app-debug.apk
+          name: EPUB-Toolkit-V5-APK
+          path: output/app.apk
           if-no-files-found: error
           retention-days: 30
+
+      # 13. AUTOMATICALLY CREATE GITHUB RELEASE
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_id }}-${{ github.run_attempt }}
+          name: EPUB Toolkit V5 Build ${{ github.run_number }}
+          prerelease: true
+          generate_release_notes: false
+          body: |
+            Automated APK build.
+
+            Download the APK below and install it on your Android device.
+          files: ${{ steps.locate.outputs.apk_path }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
