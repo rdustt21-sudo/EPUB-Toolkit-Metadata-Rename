@@ -43,8 +43,8 @@ jobs:
 
           unzip -q "$SOURCE_ZIP" -d "$SOURCE_ROOT"
 
-          echo "Extracted ZIP contents:"
-          find "$SOURCE_ROOT" -maxdepth 3 -type f | head -n 100
+          echo "Extracted files:"
+          find "$SOURCE_ROOT" -maxdepth 4 -type f
 
       - name: Detect Android project
         shell: bash
@@ -53,29 +53,17 @@ jobs:
 
           SOURCE_ROOT="$RUNNER_TEMP/android_source"
 
-          APP_GRADLE="$(find "$SOURCE_ROOT" -type f \( -name build.gradle -o -name build.gradle.kts \) | grep '/app/build.gradle' | head -n 1 || true)"
+          PROJECT_ROOT="$(dirname "$(find "$SOURCE_ROOT" -type f \( -name settings.gradle -o -name settings.gradle.kts \) | head -n 1)")"
 
-          if [ -z "$APP_GRADLE" ]; then
-            echo "ERROR: app Gradle file not found."
+          if [ -z "$PROJECT_ROOT" ] || [ ! -f "$PROJECT_ROOT/settings.gradle" ] && [ ! -f "$PROJECT_ROOT/settings.gradle.kts" ]; then
+            echo "ERROR: settings.gradle not found."
             find "$SOURCE_ROOT" -type f
             exit 1
           fi
 
-          APP_DIR="$(dirname "$APP_GRADLE")"
-          PROJECT_ROOT=""
-
-          CURRENT="$APP_DIR"
-
-          while [ "$CURRENT" != "$SOURCE_ROOT" ] && [ "$CURRENT" != "/" ]; do
-            if [ -f "$CURRENT/settings.gradle" ] || [ -f "$CURRENT/settings.gradle.kts" ]; then
-              PROJECT_ROOT="$CURRENT"
-              break
-            fi
-            CURRENT="$(dirname "$CURRENT")"
-          done
-
-          if [ -z "$PROJECT_ROOT" ]; then
-            echo "ERROR: Gradle project root not found."
+          if [ ! -f "$PROJECT_ROOT/app/build.gradle" ] && [ ! -f "$PROJECT_ROOT/app/build.gradle.kts" ]; then
+            echo "ERROR: app Gradle file not found."
+            find "$PROJECT_ROOT" -maxdepth 4 -type f
             exit 1
           fi
 
@@ -85,33 +73,21 @@ jobs:
           PROJECT_ROOT="$GITHUB_WORKSPACE/project"
           APP_DIR="$PROJECT_ROOT/app"
 
-          if [ ! -d "$APP_DIR" ]; then
-            echo "ERROR: app directory not found after extraction."
-            exit 1
-          fi
-
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
           echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
 
-          echo "Detected project: $PROJECT_ROOT"
-          echo "Detected app: $APP_DIR"
+          echo "Project detected successfully:"
+          echo "$PROJECT_ROOT"
 
       - name: Configure Android version
         shell: bash
         run: |
           set -euo pipefail
 
-          APP_GRADLE=""
+          APP_GRADLE="$APP_DIR/build.gradle"
 
-          if [ -f "$APP_DIR/build.gradle" ]; then
-            APP_GRADLE="$APP_DIR/build.gradle"
-          elif [ -f "$APP_DIR/build.gradle.kts" ]; then
+          if [ ! -f "$APP_GRADLE" ]; then
             APP_GRADLE="$APP_DIR/build.gradle.kts"
-          fi
-
-          if [ -z "$APP_GRADLE" ]; then
-            echo "ERROR: app Gradle file missing."
-            exit 1
           fi
 
           python3 - "$APP_GRADLE" <<'PY'
@@ -140,7 +116,7 @@ jobs:
           with open(path, "w", encoding="utf-8") as f:
               f.write(content)
 
-          print("Android version configuration checked.")
+          print("Version configuration complete.")
           PY
 
       - name: Setup Android SDK
@@ -156,17 +132,13 @@ jobs:
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
 
           if [ ! -x "$SDKMANAGER" ]; then
-            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f | head -n 1)"
+            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | head -n 1)"
           fi
 
           if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
             echo "ERROR: sdkmanager not found."
             exit 1
           fi
-
-          yes | "$SDKMANAGER" \
-            "platforms;android-35" \
-            "build-tools;35.0.0" || true
 
           "$SDKMANAGER" \
             "platforms;android-35" \
@@ -185,13 +157,13 @@ jobs:
           set -euo pipefail
 
           if [ -z "$KEYSTORE_BASE64" ]; then
-            echo "ERROR: V5_DEBUG_KEYSTORE_BASE64 secret is missing."
+            echo "ERROR: V5_DEBUG_KEYSTORE_BASE64 is missing."
             exit 1
           fi
 
           mkdir -p "$RUNNER_TEMP/signing"
 
-          echo "$KEYSTORE_BASE64" | base64 --decode \
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode \
             > "$RUNNER_TEMP/signing/release.keystore"
 
           echo "KEYSTORE_PATH=$RUNNER_TEMP/signing/release.keystore" >> "$GITHUB_ENV"
@@ -207,7 +179,7 @@ jobs:
 
           APK_PATH="$(find "$APP_DIR/build/outputs/apk/debug" -type f -name '*.apk' | head -n 1)"
 
-          if [ -z "$APK_PATH" ]; then
+          if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
             echo "ERROR: APK was not generated."
             exit 1
           fi
@@ -224,11 +196,6 @@ jobs:
           set -euo pipefail
 
           APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
-
-          if [ ! -f "$APKSIGNER" ]; then
-            echo "ERROR: apksigner not found."
-            exit 1
-          fi
 
           "$APKSIGNER" sign \
             --ks "$KEYSTORE_PATH" \
@@ -255,15 +222,15 @@ jobs:
 
           EXPECTED_FINGERPRINT="1e3839d0f823fc8c7fcd2888cd8901942e56b5e663995040aefabb104fde006a"
 
-          echo "Actual certificate:   $ACTUAL_FINGERPRINT"
-          echo "Expected certificate: $EXPECTED_FINGERPRINT"
+          echo "Actual:   $ACTUAL_FINGERPRINT"
+          echo "Expected: $EXPECTED_FINGERPRINT"
 
           if [ "$ACTUAL_FINGERPRINT" != "$EXPECTED_FINGERPRINT" ]; then
-            echo "ERROR: Signing certificate mismatch!"
+            echo "ERROR: Certificate mismatch."
             exit 1
           fi
 
-          echo "Persistent certificate verified successfully."
+          echo "Certificate verified successfully."
 
       - name: Verify APK
         shell: bash
@@ -272,15 +239,10 @@ jobs:
 
           APK="$GITHUB_WORKSPACE/app-release.apk"
 
-          if [ ! -s "$APK" ]; then
-            echo "ERROR: APK missing or empty."
-            exit 1
-          fi
+          test -s "$APK"
 
-          echo "APK size:"
           ls -lh "$APK"
 
-          echo "APK package information:"
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | head -n 5
 
       - name: Upload APK artifact
