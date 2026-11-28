@@ -1,298 +1,70 @@
 
-name: Build EPUB Toolkit - Update Safe
-
-on:
-  workflow_dispatch:
-  push:
-    branches: [main]
-
-permissions:
-  contents: write
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Select and prepare Android source
-        id: source
+      - name: Enforce persistent APK signing certificate
         shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import glob, zipfile, tempfile, os, re, shutil
-
-          V5_APP_ID = "com.rdustt21.epubtoolkit.v5"
-          ACCEPTED_SOURCE_IDS = {
-              V5_APP_ID,
-              "com.rdustt21.epubtoolkit.nativeport",
-          }
-
-          candidates = []
-          temp_dirs = []
-          diagnostics = []
-
-          def locate_project_root(extraction):
-              for root, dirs, files in os.walk(extraction):
-                  if not ({"settings.gradle", "settings.gradle.kts"} & set(files)):
-                      continue
-
-                  app_gradle = next(
-                      (os.path.join(root, "app", f)
-                       for f in ("build.gradle", "build.gradle.kts")
-                       if os.path.isfile(os.path.join(root, "app", f))),
-                      None
-                  )
-
-                  if app_gradle:
-                      return root, app_gradle
-
-              return None, None
-
-          def extract(pattern, content):
-              match = re.search(pattern, content, re.MULTILINE)
-              return match.group(1).strip() if match else None
-
-          for z in sorted(glob.glob("*.zip")):
-              tmp = tempfile.mkdtemp(prefix="epub-source-")
-              temp_dirs.append(tmp)
-
-              try:
-                  with zipfile.ZipFile(z) as archive:
-                      archive.extractall(tmp)
-
-                  root, gradle_file = locate_project_root(tmp)
-
-                  if not root:
-                      diagnostics.append(
-                          f"{z}: no Android Gradle project/app module found"
-                      )
-                      continue
-
-                  with open(gradle_file, encoding="utf-8") as source:
-                      content = source.read()
-
-                  appid = extract(
-                      r"applicationId\s*(?:=\s*)?['\"]([^'\"]+)['\"]",
-                      content
-                  )
-
-                  code = extract(
-                      r"versionCode\s*(?:=\s*)?(\d+)",
-                      content
-                  )
-
-                  name = extract(
-                      r"versionName\s*(?:=\s*)?['\"]([^'\"]+)['\"]",
-                      content
-                  )
-
-                  if appid not in ACCEPTED_SOURCE_IDS:
-                      diagnostics.append(
-                          f"{z}: unsupported application ID ({appid!r})"
-                      )
-                      continue
-
-                  if not code or not name:
-                      diagnostics.append(
-                          f"{z}: versionCode/versionName missing or unrecognized"
-                      )
-                      continue
-
-                  candidates.append({
-                      "zip": z,
-                      "root": root,
-                      "gradle": gradle_file,
-                      "appid": appid,
-                      "code": int(code),
-                      "name": name
-                  })
-
-              except Exception as error:
-                  diagnostics.append(f"{z}: inspection failed: {error}")
-
-          if not candidates:
-              print("Source ZIP diagnostics:")
-              for message in diagnostics:
-                  print(" -", message)
-
-              for tmp in temp_dirs:
-                  shutil.rmtree(tmp, ignore_errors=True)
-
-              raise SystemExit(
-                  "STOP: No compatible Android source ZIP found."
-              )
-
-          candidates.sort(
-              key=lambda item: (item["code"], item["zip"]),
-              reverse=True
-          )
-
-          selected = candidates[0]
-
-          print("SELECTED SOURCE:", selected["zip"])
-          print("SOURCE APP ID:", selected["appid"])
-          print("SOURCE VERSION:", selected["name"])
-          print("SOURCE VERSION CODE:", selected["code"])
-
-          shutil.rmtree("project", ignore_errors=True)
-          shutil.copytree(selected["root"], "project")
-
-          for tmp in temp_dirs:
-              shutil.rmtree(tmp, ignore_errors=True)
-
-          # Use the V5 package ID so Android updates the existing V5 app.
-          gradle_file = os.path.join(
-              "project", "app",
-              os.path.basename(selected["gradle"])
-          )
-
-          with open(gradle_file, encoding="utf-8") as f:
-              gradle = f.read()
-
-          appid_pattern = (
-              r"applicationId\s*(?:=\s*)?['\"]([^'\"]+)['\"]"
-          )
-
-          if not re.search(appid_pattern, gradle):
-              raise SystemExit(
-                  "STOP: applicationId could not be safely identified."
-              )
-
-          gradle = re.sub(
-              appid_pattern,
-              'applicationId = "' + V5_APP_ID + '"',
-              gradle,
-              count=1
-          )
-
-          # Generate a higher version code for update installation.
-          # This prevents Android from treating the APK as a downgrade.
-          run_number = int(os.environ["GITHUB_RUN_NUMBER"])
-          safe_version_code = 100000 + run_number
-
-          version_pattern = (
-              r"versionCode\s*(?:=\s*)?\d+"
-          )
-
-          if not re.search(version_pattern, gradle):
-              raise SystemExit(
-                  "STOP: versionCode could not be safely identified."
-              )
-
-          gradle = re.sub(
-              version_pattern,
-              "versionCode = " + str(safe_version_code),
-              gradle,
-              count=1
-          )
-
-          with open(gradle_file, "w", encoding="utf-8") as f:
-              f.write(gradle)
-
-          print("FINAL APPLICATION ID:", V5_APP_ID)
-          print("FINAL VERSION CODE:", safe_version_code)
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write("version_name=" + selected["name"] + "\n")
-              output.write("version_code=" + str(safe_version_code) + "\n")
-              output.write("application_id=" + V5_APP_ID + "\n")
-          PY
-
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.10.2'
-
-      - name: Install persistent V5 signing key
         env:
           KEYSTORE_BASE64: ${{ secrets.V5_DEBUG_KEYSTORE_BASE64 }}
         run: |
           set -euo pipefail
 
-          test -n "$KEYSTORE_BASE64"
-
-          mkdir -p "$HOME/.android"
-
-          printf '%s' "$KEYSTORE_BASE64" \
-            | base64 --decode > "$HOME/.android/debug.keystore"
-
-          chmod 600 "$HOME/.android/debug.keystore"
-
-          keytool -list \
-            -keystore "$HOME/.android/debug.keystore" \
-            -storepass android \
-            -alias androiddebugkey
-
-      - name: Build APK
-        working-directory: project
-        run: |
-          set -euo pipefail
-          gradle assembleDebug
-
-      - name: Verify APK identity and version
-        shell: bash
-        run: |
-          set -euo pipefail
-
           APK="project/app/build/outputs/apk/debug/app-debug.apk"
+          KEYSTORE="$HOME/.android/debug.keystore"
+
           test -f "$APK"
+          test -n "$KEYSTORE_BASE64"
+          test -f "$KEYSTORE"
 
-          BUILD_TOOLS=$(find "$ANDROID_HOME/build-tools" \
-            -mindepth 1 -maxdepth 1 -type d \
-            | sort -V | tail -n 1)
-
-          AAPT="$BUILD_TOOLS/aapt"
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
           APKSIGNER="$BUILD_TOOLS/apksigner"
 
-          BADGING=$("$AAPT" dump badging "$APK")
+          echo "Extracting persistent certificate fingerprint..."
 
-          echo "$BADGING" | grep "^package:"
+          KEY_CERT_SHA256="$(keytool -exportcert \
+            -keystore "$KEYSTORE" \
+            -storepass android \
+            -alias androiddebugkey \
+            | openssl dgst -sha256 \
+            | awk '{print $2}' \
+            | tr '[:upper:]' '[:lower:]')"
 
-          echo "$BADGING" | grep -F \
-            "name='${{ steps.source.outputs.application_id }}'" >/dev/null
+          echo "Persistent certificate:"
+          echo "$KEY_CERT_SHA256"
 
-          echo "$BADGING" | grep -F \
-            "versionCode='${{ steps.source.outputs.version_code }}'" >/dev/null
+          echo "Signing final APK with persistent key..."
 
-          "$APKSIGNER" verify --print-certs "$APK"
+          "$APKSIGNER" sign \
+            --ks "$KEYSTORE" \
+            --ks-key-alias androiddebugkey \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            "$APK"
 
-          echo "APK IDENTITY AND VERSION VERIFIED"
-          ls -lh "$APK"
+          echo "Verifying APK signature..."
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: EPUB-Toolkit-Update-${{ steps.source.outputs.version_name }}
-          path: project/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
+          "$APKSIGNER" verify --verbose --print-certs "$APK"
 
-      - name: Publish APK Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: update-${{ steps.source.outputs.version_name }}-${{ github.run_id }}
-          name: EPUB Toolkit Update ${{ steps.source.outputs.version_name }}
-          prerelease: true
-          generate_release_notes: false
-          body: |
-            Update-safe APK build.
+          APK_CERT_SHA256="$("$APKSIGNER" verify --print-certs "$APK" \
+            | grep 'Signer #1 certificate SHA-256 digest:' \
+            | head -n 1 \
+            | awk -F': ' '{print $2}' \
+            | tr -d ':' \
+            | tr '[:upper:]' '[:lower:]')"
 
-            Application ID: ${{ steps.source.outputs.application_id }}
-            Source version: ${{ steps.source.outputs.version_name }}
-            Version code: ${{ steps.source.outputs.version_code }}
+          echo "APK certificate:"
+          echo "$APK_CERT_SHA256"
 
-            This build targets the existing V5 application identity.
-          files: project/app/build/outputs/apk/debug/app-debug.apk
+          echo "Comparing signing certificates..."
+
+          if [ "$KEY_CERT_SHA256" != "$APK_CERT_SHA256" ]; then
+            echo "::error::APK signing certificate does not match persistent keystore."
+            echo "::error::Build rejected."
+            exit 1
+          fi
+
+          echo "========================================"
+          echo "SIGNING CERTIFICATE MATCH CONFIRMED"
+          echo "========================================"
+
+          echo "APK signed with persistent certificate."
