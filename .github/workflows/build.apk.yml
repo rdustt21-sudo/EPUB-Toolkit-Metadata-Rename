@@ -45,7 +45,7 @@ jobs:
           GRADLE_FILE="$(find project -type f \
             \( -name build.gradle -o -name build.gradle.kts \) \
             | grep '/app/build.gradle' \
-            | head -n 1)"
+            | head -n 1 || true)"
 
           if [ -z "$GRADLE_FILE" ]; then
             echo "::error::App Gradle file not found."
@@ -111,11 +111,15 @@ jobs:
         with:
           packages: platform-tools
 
-      - name: Install Android build tools
+      - name: Install Android SDK components
         shell: bash
         run: |
           set -euo pipefail
-          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
 
       # 6. RESTORE PERSISTENT KEYSTORE
       - name: Restore persistent signing key
@@ -151,7 +155,7 @@ jobs:
           APP_GRADLE="$(find project -type f \
             \( -name build.gradle -o -name build.gradle.kts \) \
             | grep '/app/build.gradle' \
-            | head -n 1)"
+            | head -n 1 || true)"
 
           if [ -z "$APP_GRADLE" ]; then
             echo "::error::App Gradle file not found."
@@ -183,23 +187,19 @@ jobs:
 
           APK="$(find project -type f \
             -path '*/app/build/outputs/apk/debug/app-debug.apk' \
-            | head -n 1)"
+            | head -n 1 || true)"
 
           KEYSTORE="$HOME/.android/debug.keystore"
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
 
           if [ -z "$APK" ] || [ ! -f "$APK" ]; then
             echo "::error::Built APK not found."
             exit 1
           fi
 
-          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" \
-            -mindepth 1 -maxdepth 1 -type d \
-            | sort -V | tail -n 1)"
-
-          APKSIGNER="$BUILD_TOOLS/apksigner"
-
           if [ ! -f "$APKSIGNER" ]; then
-            echo "::error::apksigner not found."
+            echo "::error::apksigner not found: $APKSIGNER"
             exit 1
           fi
 
@@ -220,7 +220,7 @@ jobs:
           echo "Persistent certificate:"
           echo "$KEY_CERT_SHA256"
 
-          # Sign APK
+          # Sign APK using persistent key
           "$APKSIGNER" sign \
             --ks "$KEYSTORE" \
             --ks-key-alias androiddebugkey \
@@ -231,10 +231,10 @@ jobs:
             --v3-signing-enabled true \
             "$APK"
 
-          # Verify signature
+          # Verify APK signature
           "$APKSIGNER" verify --verbose --print-certs "$APK"
 
-          # CORRECTLY extract SHA-256 digest
+          # Extract APK certificate fingerprint
           APK_CERT_SHA256="$("$APKSIGNER" verify \
             --print-certs "$APK" \
             | grep 'certificate SHA-256 digest:' \
@@ -259,7 +259,7 @@ jobs:
 
           echo "CERTIFICATE MATCH CONFIRMED"
 
-      # 9. VERIFY PACKAGE ID
+      # 9. VERIFY APK PACKAGE ID
       - name: Verify APK identity
         shell: bash
         run: |
@@ -267,24 +267,34 @@ jobs:
 
           APK="$(find project -type f \
             -path '*/app/build/outputs/apk/debug/app-debug.apk' \
-            | head -n 1)"
+            | head -n 1 || true)"
 
-          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" \
-            -mindepth 1 -maxdepth 1 -type d \
-            | sort -V | tail -n 1)"
+          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
 
-          APKANALYZER="$BUILD_TOOLS/apkanalyzer"
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "::error::APK not found for identity verification."
+            exit 1
+          fi
 
-          APK_PACKAGE="$("$APKANALYZER" manifest application-id "$APK")"
+          if [ ! -f "$AAPT" ]; then
+            echo "::error::aapt not found: $AAPT"
+            exit 1
+          fi
+
+          APK_PACKAGE="$("$AAPT" dump badging "$APK" \
+            | awk -F"'" '/^package: name=/{print $2; exit}')"
 
           EXPECTED_PACKAGE="com.rdustt21.epubtoolkit.v5"
+
+          echo "Detected package: $APK_PACKAGE"
+          echo "Expected package: $EXPECTED_PACKAGE"
 
           if [ "$APK_PACKAGE" != "$EXPECTED_PACKAGE" ]; then
             echo "::error::Wrong APK package ID: $APK_PACKAGE"
             exit 1
           fi
 
-          echo "Package ID verified: $APK_PACKAGE"
+          echo "Package ID verified."
           echo "FINAL APK VERIFICATION PASSED"
 
       # 10. UPLOAD VERIFIED APK
