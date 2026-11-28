@@ -1,4 +1,3 @@
-
 name: Build APK - Persistent Signing
 
 on:
@@ -184,6 +183,7 @@ jobs:
           if [ -f "$PROJECT_ROOT/gradlew" ]; then
             echo "Using project Gradle wrapper."
             chmod +x "$PROJECT_ROOT/gradlew"
+
             "$PROJECT_ROOT/gradlew" \
               -p "$PROJECT_ROOT" \
               assembleDebug \
@@ -199,7 +199,7 @@ jobs:
           fi
 
       # ==========================================
-      # 8. SIGN FINAL APK WITH PERSISTENT KEY
+      # 8. SIGN AND VERIFY PERSISTENT CERTIFICATE
       # ==========================================
       - name: Enforce persistent APK signing certificate
         shell: bash
@@ -217,7 +217,10 @@ jobs:
             exit 1
           fi
 
-          test -f "$KEYSTORE"
+          if [ ! -f "$KEYSTORE" ]; then
+            echo "::error::Persistent keystore not found."
+            exit 1
+          fi
 
           BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" \
             -mindepth 1 -maxdepth 1 -type d \
@@ -245,6 +248,11 @@ jobs:
           echo "Persistent certificate SHA256:"
           echo "$KEY_CERT_SHA256"
 
+          if [ -z "$KEY_CERT_SHA256" ]; then
+            echo "::error::Could not extract persistent certificate fingerprint."
+            exit 1
+          fi
+
           echo "=========================================="
           echo "SIGNING APK"
           echo "=========================================="
@@ -265,9 +273,10 @@ jobs:
 
           "$APKSIGNER" verify --verbose --print-certs "$APK"
 
+          # FIX: Match the actual apksigner output.
           APK_CERT_SHA256="$("$APKSIGNER" verify \
             --print-certs "$APK" \
-            | grep 'Signer #1 certificate SHA-256 digest:' \
+            | grep 'certificate SHA-256 digest:' \
             | head -n 1 \
             | awk -F': ' '{print $2}' \
             | tr -d ':' \
@@ -275,6 +284,11 @@ jobs:
 
           echo "Final APK certificate SHA256:"
           echo "$APK_CERT_SHA256"
+
+          if [ -z "$APK_CERT_SHA256" ]; then
+            echo "::error::Could not extract APK certificate fingerprint."
+            exit 1
+          fi
 
           echo "=========================================="
           echo "COMPARING CERTIFICATES"
@@ -289,6 +303,12 @@ jobs:
           echo "=========================================="
           echo "CERTIFICATE MATCH CONFIRMED"
           echo "=========================================="
+
+          echo "Persistent certificate:"
+          echo "$KEY_CERT_SHA256"
+
+          echo "APK certificate:"
+          echo "$APK_CERT_SHA256"
 
       # ==========================================
       # 9. VERIFY PACKAGE ID
