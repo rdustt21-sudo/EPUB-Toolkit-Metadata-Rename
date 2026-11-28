@@ -1,22 +1,217 @@
 
-      - name: Enforce persistent APK signing certificate
+name: Build APK - Persistent Signing
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ==========================================
+      # 1. EXTRACT SOURCE
+      # ==========================================
+      - name: Extract V5 source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_ZIP="EPUB-Toolkit-V5.0.24-Safe-Import-Cleanup.zip"
+
+          if [ ! -f "$SOURCE_ZIP" ]; then
+            echo "::error::Source ZIP not found: $SOURCE_ZIP"
+            exit 1
+          fi
+
+          mkdir -p project
+          unzip -q "$SOURCE_ZIP" -d project
+
+          echo "Source extracted successfully."
+
+      # ==========================================
+      # 2. CONFIGURE APPLICATION ID AND VERSION
+      # ==========================================
+      - name: Configure application identity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GRADLE_FILE="$(find project -type f \
+            \( -name build.gradle -o -name build.gradle.kts \) \
+            | grep '/app/build.gradle' \
+            | head -n 1)"
+
+          if [ -z "$GRADLE_FILE" ]; then
+            echo "::error::App Gradle file not found."
+            exit 1
+          fi
+
+          echo "Gradle file: $GRADLE_FILE"
+
+          python3 - "$GRADLE_FILE" <<'PY'
+          import re
+          import sys
+
+          path = sys.argv[1]
+
+          with open(path, "r", encoding="utf-8") as f:
+              content = f.read()
+
+          # Configure application ID (Groovy and Kotlin DSL)
+          app_pattern = r'(applicationId\s*(?:=\s*)?)(["\'])([^"\']+)(\2)'
+
+          content, app_count = re.subn(
+              app_pattern,
+              lambda m: m.group(1) + '"' +
+                  'com.rdustt21.epubtoolkit.v5' + '"',
+              content,
+              count=1
+          )
+
+          if app_count != 1:
+              raise SystemExit(
+                  "ERROR: Could not safely configure applicationId."
+              )
+
+          # Configure version code
+          version_pattern = r'(versionCode\s*(?:=\s*)?)\d+'
+
+          content, version_count = re.subn(
+              version_pattern,
+              lambda m: m.group(1) + '100011',
+              content,
+              count=1
+          )
+
+          if version_count != 1:
+              raise SystemExit(
+                  "ERROR: Could not safely configure versionCode."
+              )
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(content)
+
+          print("Application ID: com.rdustt21.epubtoolkit.v5")
+          print("Version code: 100011")
+          PY
+
+      # ==========================================
+      # 3. JAVA
+      # ==========================================
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # ==========================================
+      # 4. ANDROID SDK
+      # ==========================================
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      # ==========================================
+      # 5. RESTORE PERSISTENT KEYSTORE
+      # ==========================================
+      - name: Restore persistent signing key
         shell: bash
         env:
           KEYSTORE_BASE64: ${{ secrets.V5_DEBUG_KEYSTORE_BASE64 }}
         run: |
           set -euo pipefail
 
-          APK="project/app/build/outputs/apk/debug/app-debug.apk"
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::V5_DEBUG_KEYSTORE_BASE64 secret is missing."
+            exit 1
+          fi
+
+          mkdir -p "$HOME/.android"
+
+          printf '%s' "$KEYSTORE_BASE64" \
+            | base64 --decode \
+            > "$HOME/.android/debug.keystore"
+
+          chmod 600 "$HOME/.android/debug.keystore"
+
+          test -s "$HOME/.android/debug.keystore"
+
+          echo "Persistent keystore restored."
+
+      # ==========================================
+      # 6. BUILD APK
+      # ==========================================
+      - name: Build APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GRADLE_WRAPPER="$(find project -type f -name gradlew | head -n 1)"
+
+          if [ -z "$GRADLE_WRAPPER" ]; then
+            echo "::error::Gradle wrapper not found."
+            exit 1
+          fi
+
+          PROJECT_ROOT="$(dirname "$GRADLE_WRAPPER")"
+
+          cd "$PROJECT_ROOT"
+
+          chmod +x gradlew
+
+          ./gradlew assembleDebug --no-daemon
+
+      # ==========================================
+      # 7. SIGN FINAL APK WITH PERSISTENT KEY
+      # ==========================================
+      - name: Enforce persistent APK signing certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="$(find project -type f \
+            -path '*/app/build/outputs/apk/debug/app-debug.apk' \
+            | head -n 1)"
+
           KEYSTORE="$HOME/.android/debug.keystore"
 
-          test -f "$APK"
-          test -n "$KEYSTORE_BASE64"
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "::error::Built APK not found."
+            exit 1
+          fi
+
           test -f "$KEYSTORE"
 
-          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" \
+            -mindepth 1 -maxdepth 1 -type d \
+            | sort -V | tail -n 1)"
+
           APKSIGNER="$BUILD_TOOLS/apksigner"
 
-          echo "Extracting persistent certificate fingerprint..."
+          if [ ! -f "$APKSIGNER" ]; then
+            echo "::error::apksigner not found."
+            exit 1
+          fi
+
+          echo "=========================================="
+          echo "GETTING PERSISTENT CERTIFICATE"
+          echo "=========================================="
 
           KEY_CERT_SHA256="$(keytool -exportcert \
             -keystore "$KEYSTORE" \
@@ -26,10 +221,12 @@
             | awk '{print $2}' \
             | tr '[:upper:]' '[:lower:]')"
 
-          echo "Persistent certificate:"
+          echo "Persistent certificate SHA256:"
           echo "$KEY_CERT_SHA256"
 
-          echo "Signing final APK with persistent key..."
+          echo "=========================================="
+          echo "SIGNING APK"
+          echo "=========================================="
 
           "$APKSIGNER" sign \
             --ks "$KEYSTORE" \
@@ -41,30 +238,77 @@
             --v3-signing-enabled true \
             "$APK"
 
-          echo "Verifying APK signature..."
+          echo "=========================================="
+          echo "VERIFYING APK SIGNATURE"
+          echo "=========================================="
 
           "$APKSIGNER" verify --verbose --print-certs "$APK"
 
-          APK_CERT_SHA256="$("$APKSIGNER" verify --print-certs "$APK" \
+          APK_CERT_SHA256="$("$APKSIGNER" verify \
+            --print-certs "$APK" \
             | grep 'Signer #1 certificate SHA-256 digest:' \
             | head -n 1 \
             | awk -F': ' '{print $2}' \
             | tr -d ':' \
             | tr '[:upper:]' '[:lower:]')"
 
-          echo "APK certificate:"
+          echo "Final APK certificate SHA256:"
           echo "$APK_CERT_SHA256"
 
-          echo "Comparing signing certificates..."
+          echo "=========================================="
+          echo "COMPARING CERTIFICATES"
+          echo "=========================================="
 
           if [ "$KEY_CERT_SHA256" != "$APK_CERT_SHA256" ]; then
-            echo "::error::APK signing certificate does not match persistent keystore."
+            echo "::error::APK certificate does not match persistent keystore."
             echo "::error::Build rejected."
             exit 1
           fi
 
-          echo "========================================"
-          echo "SIGNING CERTIFICATE MATCH CONFIRMED"
-          echo "========================================"
+          echo "=========================================="
+          echo "CERTIFICATE MATCH CONFIRMED"
+          echo "=========================================="
 
-          echo "APK signed with persistent certificate."
+      # ==========================================
+      # 8. VERIFY PACKAGE ID
+      # ==========================================
+      - name: Verify APK identity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="$(find project -type f \
+            -path '*/app/build/outputs/apk/debug/app-debug.apk' \
+            | head -n 1)"
+
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" \
+            -mindepth 1 -maxdepth 1 -type d \
+            | sort -V | tail -n 1)"
+
+          APKANALYZER="$BUILD_TOOLS/apkanalyzer"
+
+          APK_PACKAGE="$("$APKANALYZER" manifest application-id "$APK")"
+
+          EXPECTED_PACKAGE="com.rdustt21.epubtoolkit.v5"
+
+          if [ "$APK_PACKAGE" != "$EXPECTED_PACKAGE" ]; then
+            echo "::error::Wrong APK package ID: $APK_PACKAGE"
+            exit 1
+          fi
+
+          echo "Package ID verified: $APK_PACKAGE"
+
+          echo "=========================================="
+          echo "FINAL APK VERIFICATION PASSED"
+          echo "=========================================="
+
+      # ==========================================
+      # 9. UPLOAD VERIFIED APK
+      # ==========================================
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: EPUB-Toolkit-V5-Signed
+          path: project/**/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
